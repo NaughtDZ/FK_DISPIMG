@@ -1,0 +1,2 @@
+# FK_DISPIMG
+转换WPS创建的XLSX文件因为=@_xlfn.DISPIMG这个鬼玩意导致office excel和其他excel类软件无法显示图片的问题
