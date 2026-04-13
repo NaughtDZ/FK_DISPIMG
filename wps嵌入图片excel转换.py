@@ -12,40 +12,28 @@ def wps_image_converter(input_xlsx, output_xlsx):
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
 
-    print(f"正在加载表格: {input_xlsx} ... (可能需要几秒钟)")
+    print(f"正在加载表格: {input_xlsx} ...")
     
-    # 打开表格（注意：必须开启 data_only=False，以读取公式）
     try:
+        # 必须开启 data_only=False 以读取公式
         wb = openpyxl.load_workbook(input_xlsx, data_only=False)
-        sheet = wb.active
     except Exception as e:
-        print(f"打开 Excel 失败，请检查文件是否被占用: {e}")
+        print(f"打开 Excel 失败: {e}")
         return
 
-    # 1. 查找所有包含 DISPIMG 的单元格
-    cell_to_id = {}
-    for row in sheet.iter_rows():
-        for cell in row:
-            cell_val = str(cell.value)
-            if "DISPIMG" in cell_val:
-                match = re.search(r'DISPIMG\s*\(\s*"([^"]+)"', cell_val)
-                if match:
-                    cell_to_id[cell.coordinate] = match.group(1)
-
-    if not cell_to_id:
-        print("表格中未检测到含有 WPS 嵌入图片的单元格。")
-        return
-
-    print(f"成功定位到 {len(cell_to_id)} 个包含图片的单元格，正在深入底层提取图源...")
-
-    # 2. 从压缩包读取 WPS 特有的图片映射 XML
+    # --- 第一步：解析全局图片映射 (这部分逻辑与 Sheet 无关，只需解析一次) ---
     id_to_target = {}
     try:
         with zipfile.ZipFile(input_xlsx, 'r') as z:
+            # 检查是否存在 WPS 图片容器文件
+            if 'xl/cellimages.xml' not in z.namelist():
+                print("未在文件中找到 WPS 嵌入图片容器，请确认文件是否包含嵌入图片。")
+                return
+
             cellimages_bytes = z.read('xl/cellimages.xml')
             rels_bytes = z.read('xl/_rels/cellimages.xml.rels')
 
-            # 解析 .rels 提取 rId -> 物理路径
+            # 解析 rId -> 物理路径
             rId_to_target = {}
             rels_root = ET.fromstring(rels_bytes)
             for elem in rels_root.iter():
@@ -55,11 +43,10 @@ def wps_image_converter(input_xlsx, output_xlsx):
                     if rid and target:
                         rId_to_target[rid] = target
 
-            # 解析 cellimages.xml 提取图片 ID -> rId
+            # 解析 图片ID -> rId
             cellimages_root = ET.fromstring(cellimages_bytes)
             for child in cellimages_root:
-                name = None
-                embed = None
+                name, embed = None, None
                 for sub in child.iter():
                     for k, v in sub.attrib.items():
                         if k.endswith('name') and str(v).startswith('ID_'):
@@ -69,68 +56,76 @@ def wps_image_converter(input_xlsx, output_xlsx):
                 if name and embed and embed in rId_to_target:
                     id_to_target[name] = rId_to_target[embed]
 
-            print("\n开始自动清空假公式并植入真图片...")
-            success_count = 0
+            # --- 第二步：遍历每一个工作表进行处理 ---
+            total_success_count = 0
             
-            # 3. 提取图片并直接插回 openpyxl 的工作表中
-            for coord, img_id in cell_to_id.items():
-                target_path = id_to_target.get(img_id)
-                if not target_path:
+            for sheet in wb.worksheets:
+                print(f"\n正在处理工作表: [{sheet.title}]")
+                sheet_success_count = 0
+                
+                # 查找当前表中包含 DISPIMG 的单元格
+                cell_to_id = {}
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        cell_val = str(cell.value)
+                        if "DISPIMG" in cell_val:
+                            match = re.search(r'DISPIMG\s*\(\s*"([^"]+)"', cell_val)
+                            if match:
+                                cell_to_id[cell.coordinate] = match.group(1)
+
+                if not cell_to_id:
+                    print(f"  > 该工作表未检测到嵌入图片，跳过。")
                     continue
 
-                # 拼装安全的 zip 内绝对路径
-                if target_path.startswith('/'):
-                    full_target_path = target_path[1:]
-                elif target_path.startswith('xl/'):
-                    full_target_path = target_path
-                else:
-                    full_target_path = f"xl/{target_path}"
+                # 插入图片
+                for coord, img_id in cell_to_id.items():
+                    target_path = id_to_target.get(img_id)
+                    if not target_path:
+                        continue
 
-                # 提取图片到临时文件夹
-                ext = full_target_path.split('.')[-1]
-                temp_img_path = os.path.join(temp_dir, f"{coord}.{ext}")
-                
-                try:
-                    with z.open(full_target_path) as source, open(temp_img_path, 'wb') as target_file:
-                        shutil.copyfileobj(source, target_file)
+                    # 路径格式化
+                    if target_path.startswith('/'):
+                        full_target_path = target_path[1:]
+                    elif target_path.startswith('xl/'):
+                        full_target_path = target_path
+                    else:
+                        full_target_path = f"xl/{target_path}"
 
-                    # 将物理图片转换为 Excel 支持的格式并插入
-                    img = Image(temp_img_path)
+                    # 提取并插入
+                    ext = full_target_path.split('.')[-1]
+                    # 为了防止多张表有相同坐标导致文件名冲突，加上 sheet.title
+                    safe_title = re.sub(r'[\\/*?:\[\]]', '_', sheet.title) 
+                    temp_img_path = os.path.join(temp_dir, f"{safe_title}_{coord}.{ext}")
                     
-                    # 【图片大小调整区】 (默认把宽和高固定为90像素，避免过大遮挡)
-                    img.width = 90
-                    img.height = 90
-                    
-                    sheet.add_image(img, coord)
+                    try:
+                        with z.open(full_target_path) as source, open(temp_img_path, 'wb') as target_file:
+                            shutil.copyfileobj(source, target_file)
 
-                    # 最关键的一步：把这个单元格里的 =_xlfn.DISPIMG 公式彻底删掉
-                    sheet[coord].value = ""
+                        img = Image(temp_img_path)
+                        img.width, img.height = 90, 90 # 默认大小
+                        sheet.add_image(img, coord)
+                        sheet[coord].value = "" # 清空原公式
+                        
+                        sheet_success_count += 1
+                        total_success_count += 1
+                    except Exception as e:
+                        print(f"  > [失败] 单元格 {coord} 报错: {e}")
 
-                    success_count += 1
-                    print(f"--> [OK] 单元格 {coord} 图片已成功修复")
+                print(f"  > 完成！该表修复了 {sheet_success_count} 张图片。")
 
-                except Exception as e:
-                    print(f"--> [失败] 处理单元格 {coord} 时报错: {e}")
-                    
-    except KeyError:
-        print("解析文件底层失败，未能找到 WPS 的底层图片容器。")
+    except Exception as e:
+        print(f"解析底层数据时发生致命错误: {e}")
         return
 
-    # 4. 全部处理完后，另存为大家都能打开的新表格
-    print(f"\n正在保存转化后的新文件: {output_xlsx} ...")
+    # 保存文件
+    print(f"\n正在保存到: {output_xlsx} ...")
     wb.save(output_xlsx)
-    
-    # 5. 可选：用完即毁，清除刚才当做跳板的提取图片文件夹 (如果你想看原图，可以把下行注释掉)
     shutil.rmtree(temp_dir, ignore_errors=True)
     
     print(f"==================================================")
-    print(f"完美收工！共修复 {success_count} 张图片。")
-    print(f"原始文件完好无损，修复后的文件请查看：{output_xlsx}")
+    print(f"全部任务完成！累计修复 {total_success_count} 张图片。")
 
-# ================= 运行区 =================
-# 原来的文件
-input_file = 'aaa.xlsx'
-# 想要生成的新文件
-output_file = 'bbb.xlsx'
-
+# 运行
+input_file = 'xxx.xlsx'
+output_file = 'xxx2.xlsx'
 wps_image_converter(input_file, output_file)
